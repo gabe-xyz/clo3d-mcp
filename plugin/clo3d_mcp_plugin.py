@@ -715,19 +715,41 @@ def _handle_one_request():
     return True
 
 
+HEARTBEAT_FILE = os.path.join(COMM_DIR, "heartbeat.txt")
+
+
 def _tick(hwnd, msg, timer_id, time_ms):
-    state = getattr(builtins, "_clo3d_mcp", None)
-    if not state or state["busy"]:  # a long call (e.g. simulate) may pump messages and re-enter
-        return
-    state["busy"] = True
+    # NOTHING may escape a ctypes timer callback: an exception raised here is printed by ctypes and the next tick
+    # may never be scheduled, which is how the channel died silently with a request left unread (2026-10-18).
     try:
-        _handle_one_request()
-    except Exception as e:
-        print("[CLO MCP] Error: " + str(e))
-    finally:
-        state["busy"] = False
-    if state["stop"] and getattr(builtins, "_clo3d_mcp", None) is state:
-        stop()
+        state = getattr(builtins, "_clo3d_mcp", None)
+        if not state:
+            return
+        now = time.time()
+        if now - state.get("beat", 0) > 1.0:   # heartbeat: a dead timer is visible as a stale file, not a silent hang
+            state["beat"] = now
+            try:
+                with open(HEARTBEAT_FILE, "w") as f:
+                    f.write("%.0f %d" % (now, state.get("handled", 0)))
+            except OSError:
+                pass
+        if state["busy"]:  # a long call (e.g. simulate) may pump messages and re-enter
+            return
+        state["busy"] = True
+        try:
+            if _handle_one_request():
+                state["handled"] = state.get("handled", 0) + 1
+        except Exception as e:
+            print("[CLO MCP] Error: " + str(e))
+        finally:
+            state["busy"] = False
+        if state["stop"] and getattr(builtins, "_clo3d_mcp", None) is state:
+            stop()
+    except BaseException as e:   # noqa: BLE001  deliberately total
+        try:
+            print("[CLO MCP] tick error (kept alive): " + repr(e))
+        except Exception:
+            pass
 
 
 def _prepare_comm_dir():
@@ -755,6 +777,13 @@ def start():
         print("[CLO MCP] Please report this at github.com/Ubani-Studio/clo3d-mcp/issues with your CLO3D version.")
         return
 
+    if sys.platform == "win32" and not os.environ.get("CLO3D_MCP_TIMER"):
+        # 2026-10-18: in CLO 2024.1 a timer set from Python never fires its callback (probed on CLO's GUI thread,
+        # thread and window timers, zero ticks), and CLO crashed three times (15, 16, 18 Oct) with BEX64 in
+        # Qt5Core.dll, the signature of a timer callback thunk freed while Windows still held the timer. Off by
+        # default; drive CLO with ala-clo-exec (the Python Editor) instead. CLO3D_MCP_TIMER=1 re-enables it.
+        print("[CLO MCP] Timer listener disabled in this build (see ala-clo-exec).")
+        return
     if sys.platform == "win32":
         callback = _TIMERPROC(_tick)
         timer_id = _user32.SetTimer(None, 0, int(POLL_INTERVAL * 1000), callback)
